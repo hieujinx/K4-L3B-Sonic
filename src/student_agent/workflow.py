@@ -84,17 +84,31 @@ def _extract_case_values(case: dict[str, Any], *names: str) -> list[str]:
 def _first_value(case: dict[str, Any], *names: str) -> str | None:
     target_names = tuple(name.lower() for name in names)
 
+    def scalar(value: Any) -> str | None:
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            text = str(value).strip()
+            return text or None
+        return None
+
+    for name in names:
+        value = case.get(name)
+        text = scalar(value)
+        if text is not None:
+            return text
+
     def walk(node: Any) -> str | None:
         if isinstance(node, dict):
             for key, value in node.items():
                 lowered = str(key).lower()
                 if any(target in lowered for target in target_names):
-                    if isinstance(value, (str, int, float, bool)):
-                        return str(value)
+                    text = scalar(value)
+                    if text is not None:
+                        return text
                     if isinstance(value, (list, tuple)):
                         for item in value:
-                            if isinstance(item, (str, int, float, bool)):
-                                return str(item)
+                            text = scalar(item)
+                            if text is not None:
+                                return text
                     if isinstance(value, dict):
                         nested = walk(value)
                         if nested is not None:
@@ -193,17 +207,9 @@ async def _collect_evidence(
     if not tool_names:
         return evidence_records, evidence_refs
 
-    req_keys = [
-        ("customer_unique_id", _first_value(case, "customer_unique_id", "customer_id", "customer")),
-        ("order_id", _first_value(case, "order_id", "order_ids", "order")),
-        ("seller_id", _first_value(case, "seller_id", "seller")),
-        ("shipment_id", _first_value(case, "shipment_id", "shipment", "tracking_id")),
-        ("payment_reference", _first_value(case, "payment_reference", "payment_ref", "payment_reference_id")),
-    ]
-    payload: dict[str, str] = {"case_id": case_id}
-    for key_name, value in req_keys:
-        if value:
-            payload[key_name] = str(value)
+    customer_id = _first_value(case, "customer_unique_id_hint", "customer_unique_id", "customer_id")
+    order_id = _first_value(case, "claimed_order_id", "order_id")
+    policy_version = _first_value(case, "policy_version")
 
     alias_map = {
         "customer": ["get_customer_history", "get_customer_context", "get_customer_profile"],
@@ -213,15 +219,19 @@ async def _collect_evidence(
         "policy": ["get_policy", "get_policy_rules", "lookup_policy"],
     }
 
-    selected_tools: list[str] = []
-    for name in tool_names:
-        lowered = name.lower()
-        if any(alias in lowered for alias in ("customer", "order", "shipment", "payment", "policy")):
-            selected_tools.append(name)
-
-    for tool_name in selected_tools[:6]:
+    for tool_name in tool_names[:10]:
+        lowered = tool_name.lower()
+        arguments: dict[str, str] = {}
+        if "customer" in lowered and customer_id:
+            arguments["customer_unique_id"] = customer_id
+        elif "policy" in lowered and policy_version:
+            arguments["policy_version"] = policy_version
+        elif any(token in lowered for token in ("order", "shipment", "seller", "product", "payment", "refund")) and order_id:
+            arguments["order_id"] = order_id
+        else:
+            continue
         try:
-            evidence = await gateway.call(tool_name, case_id=case_id, **payload)
+            evidence = await gateway.call(tool_name, case_id=case_id, **arguments)
         except Exception:
             continue
         if not isinstance(evidence, dict):
@@ -230,7 +240,8 @@ async def _collect_evidence(
         if not isinstance(ref, str) or not ref.startswith("ev_"):
             continue
         evidence_records.append(evidence)
-        evidence_refs.append(ref)
+        if ref not in evidence_refs:
+            evidence_refs.append(ref)
     return evidence_records, evidence_refs
 
 
@@ -258,7 +269,9 @@ async def solve_case(
     seller_ids = _extract_case_values(case, "seller")
     payment_refs = _extract_case_values(case, "payment")
     shipment_ids = _extract_case_values(case, "shipment", "tracking")
-    customer_unique_id = _first_value(case, "customer_unique_id", "customer_id", "customer")
+    customer_unique_id = _first_value(
+        case, "customer_unique_id_hint", "customer_unique_id", "customer_id"
+    )
     claim_id = _first_value(case, "claim_id", "claim")
 
     evidence_records, evidence_refs = await _collect_evidence(case, gateway, case_id=case_id)
