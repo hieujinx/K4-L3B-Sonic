@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ class TraceWriter:
     def __init__(self, path: Path, contracts: Contracts) -> None:
         self.path = path
         self.contracts = contracts
+        self._write_lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(
@@ -46,6 +48,8 @@ class TraceWriter:
         }
         event.update({key: value for key, value in optional.items() if value is not None})
         self.contracts.validate_trace(event, "trace event")
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        serialized = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with self._write_lock, self.path.open("a", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
         return event
